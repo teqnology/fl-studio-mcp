@@ -14,6 +14,7 @@ instead of keystrokes.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import time
 from pathlib import Path
@@ -96,17 +97,27 @@ class MIDIConnection:
             )
             return False
 
-        # Look for IAC Driver (Mac) or other virtual MIDI ports
+        # Port priority: explicit override, then virtual loopback, then FL-ish names.
+        # A hardware port such as "FL STUDIO FIRE" matches "FL" but is NOT the
+        # controller script's port, so loopback is checked first.
         target_port = None
-        for port_name in output_ports:
-            # Prefer IAC Driver on Mac
-            if "IAC" in port_name:
-                target_port = port_name
-                break
-            # Also accept loopMIDI on Windows or any port with "FL" in name
-            if "loopMIDI" in port_name or "FL" in port_name.upper():
-                target_port = port_name
-                break
+
+        preferred = os.environ.get("FL_MIDI_PORT")
+        if preferred:
+            target_port = next(
+                (p for p in output_ports if preferred.lower() in p.lower()), None
+            )
+
+        if target_port is None:
+            for match in ("IAC", "loopMIDI"):
+                target_port = next(
+                    (p for p in output_ports if match.lower() in p.lower()), None
+                )
+                if target_port is not None:
+                    break
+
+        if target_port is None:
+            target_port = next((p for p in output_ports if "FL" in p.upper()), None)
 
         # If no specific port found, use the first available
         if target_port is None:
