@@ -229,6 +229,10 @@ def dispatch_command(action: str, params: dict) -> dict:
     elif action == "plugins.getColor":
         return handle_plugins_get_color(params)
 
+    # AR/IA extensions: routing, patterns, playlist, markers, full audit
+    elif action.startswith("ext."):
+        return handle_ext(action, params)
+
     else:
         return {"error": f"Unknown action: {action}"}
 
@@ -873,3 +877,136 @@ def handle_plugins_get_color(params: dict) -> dict:
         color = plugins.getColor(index, -1, use_global)
 
     return {"color": hex(color)}
+
+
+# =============================================================================
+# AR/IA extension handlers (branch: aria-ext)
+# Mixer-to-mixer routing, pattern + playlist naming/colours, time markers,
+# and a full project audit. Every call is wrapped so a missing API function
+# returns an error instead of breaking the controller.
+# =============================================================================
+
+
+def _rgb(params: dict) -> int:
+    return (int(params.get("r", 0)) << 16) | (int(params.get("g", 0)) << 8) | int(params.get("b", 0))
+
+
+def _ext_mixer_routes(src: int) -> list:
+    n = mixer.trackCount()
+    return [d for d in range(n) if d != src and mixer.getRouteSendActive(src, d)]
+
+
+def _ext_slots(track: int) -> list:
+    out = []
+    for slot in range(10):
+        try:
+            if plugins.isValid(track, slot):
+                out.append({"slot": slot, "plugin": plugins.getPluginName(track, slot)})
+        except Exception:
+            pass
+    return out
+
+
+def handle_ext(action: str, params: dict) -> dict:
+    try:
+        if action == "ext.getRoutes":
+            src = int(params.get("track", 0))
+            return {"track": src, "name": mixer.getTrackName(src), "routes": _ext_mixer_routes(src)}
+
+        if action == "ext.setRoute":
+            src, dest = int(params["src"]), int(params["dest"])
+            enabled = bool(params.get("enabled", True))
+            exclusive = bool(params.get("exclusive", False))
+            if exclusive:
+                for d in _ext_mixer_routes(src):
+                    if d != dest:
+                        mixer.setRouteTo(src, d, 0)
+            mixer.setRouteTo(src, dest, 1 if enabled else 0)
+            mixer.afterRoutingChanged()
+            return {"src": src, "dest": dest, "routes_now": _ext_mixer_routes(src)}
+
+        if action == "ext.mixerAudit":
+            n = mixer.trackCount()
+            tracks = []
+            for i in range(n):
+                name = mixer.getTrackName(i)
+                slots = _ext_slots(i)
+                default = name in (f"Insert {i}", "Master", "Current", "")
+                if not default or slots or i == 0:
+                    tracks.append({"index": i, "name": name, "color": hex(mixer.getTrackColor(i)),
+                                   "routes": _ext_mixer_routes(i), "plugins": slots,
+                                   "muted": mixer.isTrackMuted(i) == 1})
+            return {"tracks": tracks}
+
+        if action == "ext.channelAudit":
+            out = []
+            for i in range(channels.channelCount(True)):
+                d = {"index": i, "name": channels.getChannelName(i, True),
+                     "color": hex(channels.getChannelColor(i, True)),
+                     "target_fx_track": channels.getTargetFxTrack(i, True),
+                     "muted": channels.isChannelMuted(i, True) == 1}
+                try:
+                    d["type"] = channels.getChannelType(i, True)
+                except Exception:
+                    pass
+                try:
+                    d["plugin"] = plugins.getPluginName(i, -1, False, True)
+                except Exception:
+                    d["plugin"] = None
+                out.append(d)
+            return {"channels": out}
+
+        if action == "ext.getPatterns":
+            import patterns
+            out = []
+            for i in range(1, patterns.patternCount() + 1):
+                out.append({"index": i, "name": patterns.getPatternName(i),
+                            "color": hex(patterns.getPatternColor(i)),
+                            "length_beats": patterns.getPatternLength(i)})
+            return {"patterns": out}
+
+        if action == "ext.setPatternName":
+            import patterns
+            patterns.setPatternName(int(params["index"]), params.get("name", ""))
+            return {"index": params["index"], "name": params.get("name", "")}
+
+        if action == "ext.setPatternColor":
+            import patterns
+            patterns.setPatternColor(int(params["index"]), _rgb(params))
+            return {"index": params["index"], "color": hex(_rgb(params))}
+
+        if action == "ext.selectPattern":
+            import patterns
+            patterns.jumpToPattern(int(params["index"]))
+            return {"current": patterns.patternNumber()}
+
+        if action == "ext.getPlaylistTracks":
+            import playlist
+            out = []
+            for i in range(1, playlist.trackCount() + 1):
+                name = playlist.getTrackName(i)
+                if params.get("include_empty") or not name.startswith("Track "):
+                    out.append({"index": i, "name": name, "color": hex(playlist.getTrackColor(i))})
+            return {"tracks": out}
+
+        if action == "ext.setPlaylistTrackName":
+            import playlist
+            playlist.setTrackName(int(params["index"]), params.get("name", ""))
+            return {"index": params["index"], "name": params.get("name", "")}
+
+        if action == "ext.setPlaylistTrackColor":
+            import playlist
+            playlist.setTrackColor(int(params["index"]), _rgb(params))
+            return {"index": params["index"], "color": hex(_rgb(params))}
+
+        if action == "ext.addTimeMarker":
+            import arrangement
+            import general
+            ppq = general.getRecPPQ()
+            bar = int(params.get("bar", 1))
+            arrangement.addAutoTimeMarker((bar - 1) * 4 * ppq, params.get("name", ""))
+            return {"bar": bar, "name": params.get("name", "")}
+
+        return {"error": f"Unknown ext action: {action}"}
+    except Exception as e:
+        return {"error": f"{action} failed: {e}"}
